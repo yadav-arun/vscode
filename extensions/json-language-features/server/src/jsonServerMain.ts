@@ -115,8 +115,11 @@ documents.listen(connection);
 
 let clientSnippetSupport = false;
 let dynamicFormatterRegistration = false;
-let foldingRangeLimit = Number.MAX_VALUE;
 let hierarchicalDocumentSymbolSupport = false;
+
+let foldingRangeLimitDefault = Number.MAX_VALUE;
+let foldingRangeLimit = Number.MAX_VALUE;
+let resultLimit = Number.MAX_VALUE;
 
 // After the server has started the client sends an initialize request. The server receives
 // in the passed params the rootPath of the workspace plus the client capabilities.
@@ -145,7 +148,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
 
 	clientSnippetSupport = getClientCapability('textDocument.completion.completionItem.snippetSupport', false);
 	dynamicFormatterRegistration = getClientCapability('textDocument.rangeFormatting.dynamicRegistration', false) && (typeof params.initializationOptions.provideFormatter !== 'boolean');
-	foldingRangeLimit = getClientCapability('textDocument.foldingRange.rangeLimit', Number.MAX_VALUE);
+	foldingRangeLimitDefault = getClientCapability('textDocument.foldingRange.rangeLimit', Number.MAX_VALUE);
 	hierarchicalDocumentSymbolSupport = getClientCapability('textDocument.documentSymbol.hierarchicalDocumentSymbolSupport', false);
 	const capabilities: ServerCapabilities = {
 		// Tell the client that the server works in FULL text document sync mode
@@ -169,6 +172,7 @@ interface Settings {
 	json: {
 		schemas: JSONSchemaSettings[];
 		format: { enable: boolean; };
+		resultLimit?: number;
 	};
 	http: {
 		proxy: string;
@@ -182,6 +186,31 @@ interface JSONSchemaSettings {
 	schema?: JSONSchema;
 }
 
+namespace LimitExceededWarnings {
+	const pendingWarnings: { [uri: string]: number } = {};
+	const warned: { [uri: string]: boolean } = {};
+
+	export function cancel(uri: string) {
+		const existing = pendingWarnings[uri];
+		if (existing) {
+			clearTimeout(existing);
+			delete pendingWarnings[uri];
+		}
+	}
+
+	export function onResultLimitExceeded(uri: string, resultLimit: number, name: string) {
+		return () => {
+			if (!warned[uri]) {
+				cancel(uri);
+				pendingWarnings[uri] = setTimeout(() => {
+					warned[uri] = true;
+					connection.window.showInformationMessage(`The number of computed ${name} has been capped to ${resultLimit} for performance reasons.`);
+				});
+			}
+		};
+	}
+}
+
 let jsonConfigurationSettings: JSONSchemaSettings[] | undefined = undefined;
 let schemaAssociations: ISchemaAssociations | undefined = undefined;
 let formatterRegistration: Thenable<Disposable> | null = null;
@@ -193,6 +222,9 @@ connection.onDidChangeConfiguration((change) => {
 
 	jsonConfigurationSettings = settings.json && settings.json.schemas;
 	updateConfiguration();
+
+	foldingRangeLimit = Math.trunc(Math.max(settings.json && settings.json.resultLimit || foldingRangeLimitDefault, 0));
+	resultLimit = Math.trunc(Math.max(settings.json && settings.json.resultLimit || Number.MAX_VALUE, 0));
 
 	// dynamically enable & disable the formatter
 	if (dynamicFormatterRegistration) {
@@ -270,11 +302,13 @@ function updateConfiguration() {
 // The content of a text document has changed. This event is emitted
 // when the text document first opened or when its content has changed.
 documents.onDidChangeContent((change) => {
+	LimitExceededWarnings.cancel(change.document.uri);
 	triggerValidation(change.document);
 });
 
 // a document has closed: clear all diagnostics
 documents.onDidClose(event => {
+	LimitExceededWarnings.cancel(event.document.uri);
 	cleanPendingValidation(event.document);
 	connection.sendDiagnostics({ uri: event.document.uri, diagnostics: [] });
 });
@@ -383,10 +417,11 @@ connection.onDocumentSymbol((documentSymbolParams, token) => {
 		const document = documents.get(documentSymbolParams.textDocument.uri);
 		if (document) {
 			const jsonDocument = getJSONDocument(document);
+			const onResultLimitExceeded = LimitExceededWarnings.onResultLimitExceeded(document.uri, resultLimit, 'Document Symbols');
 			if (hierarchicalDocumentSymbolSupport) {
-				return languageService.findDocumentSymbols2(document, jsonDocument);
+				return languageService.findDocumentSymbols2(document, jsonDocument, { resultLimit, onResultLimitExceeded });
 			} else {
-				return languageService.findDocumentSymbols(document, jsonDocument);
+				return languageService.findDocumentSymbols(document, jsonDocument, { resultLimit, onResultLimitExceeded });
 			}
 		}
 		return [];
@@ -407,8 +442,9 @@ connection.onDocumentColor((params, token) => {
 	return runSafeAsync(async () => {
 		const document = documents.get(params.textDocument.uri);
 		if (document) {
+			const onResultLimitExceeded = LimitExceededWarnings.onResultLimitExceeded(document.uri, resultLimit, 'document colors');
 			const jsonDocument = getJSONDocument(document);
-			return languageService.findDocumentColors(document, jsonDocument);
+			return languageService.findDocumentColors(document, jsonDocument, { resultLimit, onResultLimitExceeded });
 		}
 		return [];
 	}, [], `Error while computing document colors for ${params.textDocument.uri}`, token);
@@ -429,7 +465,8 @@ connection.onFoldingRanges((params, token) => {
 	return runSafe(() => {
 		const document = documents.get(params.textDocument.uri);
 		if (document) {
-			return languageService.getFoldingRanges(document, { rangeLimit: foldingRangeLimit });
+			const onRangeLimitExceeded = LimitExceededWarnings.onResultLimitExceeded(document.uri, foldingRangeLimit, 'folding ranges');
+			return languageService.getFoldingRanges(document, { rangeLimit: foldingRangeLimit, onRangeLimitExceeded });
 		}
 		return null;
 	}, null, `Error while computing folding ranges for ${params.textDocument.uri}`, token);
